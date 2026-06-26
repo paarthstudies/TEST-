@@ -16,7 +16,7 @@ app = FastAPI(title="Offline Tabular & Document RAG Backend")
 # --- Configurations ---
 LANCE_DB_PATH = "./.lancedb"
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "llama3"  # Change to "mistral" or your local model if needed
+OLLAMA_MODEL = "llama3"  # Will default to this model for both condensation and answering
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 # --- Embeddings Setup ---
@@ -26,9 +26,10 @@ embedding_function = registry.create(name=EMBEDDING_MODEL_NAME, device="cpu")
 # --- Database Schema ---
 class DocumentChunk(LanceModel):
     vector: Vector(embedding_function.ndims()) = embedding_function.VectorField()
-    text: str = embedding_function.SourceField()
+    text: str = embedding_function.SourceField()  # Always use SourceField to avoid registry resolution errors
     source: str
     source_type: str  # 'tabular' or 'standard'
+    sheet_name: str = ""  # Multi-tab excel support metadata
 
 # Connect to database
 db = lancedb.connect(LANCE_DB_PATH)
@@ -71,63 +72,141 @@ def process_standard_file(file_path: str, filename: str) -> List[str]:
             break
     return chunks
 
-def process_tabular_file(file_path: str, filename: str) -> List[str]:
-    """Reads CSV/Excel files and applies our Entity-Anchored Serialization."""
+def process_tabular_file(file_path: str, filename: str) -> List[dict]:
+    """Reads CSV/Excel files (supporting multi-tab Excel sheets),
+    dynamically strips title blocks/empty headers per sheet,
+    and applies our Entity-Anchored Serialization."""
     ext = os.path.splitext(filename)[1].lower()
     
+    sheets_data = {}
     if ext == ".csv":
-        df_raw = pd.read_csv(file_path, header=None)
+        try:
+            df = pd.read_csv(file_path, header=None)
+            sheets_data[""] = df  # CSV has no tab name, default to empty string
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read CSV: {str(e)}")
     elif ext in [".xls", ".xlsx"]:
-        df_raw = pd.read_excel(file_path, header=None)
+        try:
+            # Read all sheets; returns dict of {sheet_name: df}
+            sheets_data = pd.read_excel(file_path, sheet_name=None, header=None)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read Excel sheets: {str(e)}")
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported tabular file type: {ext}")
 
-    # Sweep first 15 rows to find the true header
-    head_df = df_raw.head(15).fillna("")
-    max_non_empty = -1
-    header_idx = 0
-    
-    for idx, row in head_df.iterrows():
-        non_empty_count = sum(1 for val in row if str(val).strip() != "")
-        if non_empty_count > max_non_empty:
-            max_non_empty = non_empty_count
-            header_idx = idx
+    all_chunks = []
 
-    chunks = []
-    if max_non_empty == 0:
-        return chunks
+    for sheet_name, df in sheets_data.items():
+        if df is None or df.empty:
+            continue
 
-    # Re-read with the correct header index
-    if ext == ".csv":
-        df = pd.read_csv(file_path, header=header_idx)
-    elif ext in [".xls", ".xlsx"]:
-        df = pd.read_excel(file_path, header=header_idx)
-        
-    df = df.fillna("")
-    columns = df.columns.tolist()
+        # --- Messy Spreadsheet Cleanup Heuristic ---
+        # Look at the first 15 rows and find the one containing the maximum non-empty cells.
+        header_row_idx = 0
+        max_non_empty = 0
+        for i in range(min(15, len(df))):
+            non_empty_count = df.iloc[i].notna().sum()
+            if non_empty_count > max_non_empty:
+                max_non_empty = non_empty_count
+                header_row_idx = i
 
-    if len(columns) == 0:
-        return chunks
+        # Extract the header row and clean column names
+        raw_headers = df.iloc[header_row_idx].tolist()
+        headers = []
+        for idx, h in enumerate(raw_headers):
+            header_str = str(h).strip() if pd.notna(h) else ""
+            if header_str != "":
+                headers.append(header_str)
+            else:
+                headers.append(f"Column_{idx}")
 
-    primary_col = columns[0]  # Assume 1st column is the primary entity anchor
+        # Slice the dataframe from the header row downwards
+        sheet_df = df.iloc[header_row_idx + 1:].copy()
+        sheet_df.columns = headers
 
-    for idx, row in df.iterrows():
-        entity_name = str(row[primary_col]).strip()
-        if not entity_name:
-            entity_name = f"Row #{idx + 1}"
+        # Clean up empty padding rows & structural columns
+        sheet_df = sheet_df.dropna(how="all")
+        sheet_df = sheet_df.dropna(how="all", axis=1)
+        # Remove entirely empty unnamed columns
+        sheet_df = sheet_df.loc[:, [col for col in sheet_df.columns if not col.startswith("Column_") or sheet_df[col].astype(str).str.strip().any()]]
+        sheet_df = sheet_df.fillna("")
 
-        # Construct semantic facts repeating the entity name to boost retrieval
-        facts = []
-        for col in columns[1:]:
-            val = str(row[col]).strip()
-            if val:
-                facts.append(f"The {col} of {entity_name} is {val}.")
-        
-        if facts:
-            anchored_sentence = f"Regarding {primary_col} {entity_name}: " + " ".join(facts)
-            chunks.append(anchored_sentence)
+        columns = sheet_df.columns.tolist()
+        if len(columns) == 0:
+            continue
 
-    return chunks
+        primary_col = columns[0]
+
+        for idx, row in sheet_df.iterrows():
+            entity_name = str(row[primary_col]).strip()
+            if not entity_name:
+                row_vals = [str(row[c]).strip() for c in columns if str(row[c]).strip()]
+                entity_name = row_vals[0] if row_vals else f"Row #{idx + 1}"
+
+            # Construct semantic facts repeating entity name with sheet context
+            facts = []
+            for col in columns[1:]:
+                val = str(row[col]).strip()
+                if val:
+                    if sheet_name:
+                        facts.append(f"The {col} of {entity_name} in sheet '{sheet_name}' is {val}.")
+                    else:
+                        facts.append(f"The {col} of {entity_name} is {val}.")
+            
+            sheet_prefix = f"Regarding sheet '{sheet_name}', " if sheet_name else ""
+            anchored_sentence = f"{sheet_prefix}under column {primary_col} '{entity_name}': " + " ".join(facts)
+            
+            all_chunks.append({
+                "text": anchored_sentence,
+                "source_type": "tabular",
+                "sheet_name": sheet_name
+            })
+
+    return all_chunks
+
+# --- Query Condensation Engine ---
+
+def condense_query(chat_history: list, current_query: str) -> str:
+    """Uses our local Ollama model to condense conversational query history."""
+    if not chat_history:
+        return current_query  # Return raw query if no history exists
+
+    # Format history context (limiting to the last 4 messages)
+    formatted_history = ""
+    for msg in chat_history[-4:]:
+        role = "User" if msg.get("role", "user") == "user" else "Assistant"
+        content = msg.get("content", "")
+        formatted_history += f"{role}: {content}\n"
+
+    system_prompt = (
+        "You are an AI query-refactoring engine executing on an offline database.\n"
+        "Your task is to analyze the chat history and the follow-up question below, "
+        "and rephrase the follow-up question into a standalone, keyword-rich search query.\n"
+        "You must resolve all pronouns (e.g. 'he', 'she', 'it', 'their', 'his', 'her') to their "
+        "corresponding entity names based on the conversation history.\n"
+        "DO NOT answer the question. Return ONLY the rephrased standalone search query.\n\n"
+        f"--- CONVERSATION HISTORY ---\n{formatted_history}\n"
+        f"--- FOLLOW-UP QUESTION ---\n{current_query}\n\n"
+        "Standalone Query:"
+    )
+
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": system_prompt,
+                "stream": False
+            },
+            timeout=15
+        )
+        condensed_query = response.json().get("response", current_query).strip()
+        # Clean potential wrapped quotes from Ollama
+        condensed_query = condensed_query.strip('"\'')
+        return condensed_query
+    except Exception as e:
+        # Graceful fallback on network timeout
+        return current_query
 
 # --- API Endpoints ---
 
@@ -147,21 +226,27 @@ async def upload_file(file: UploadFile = File(...)):
         source_type = "tabular" if is_tabular else "standard"
 
         if is_tabular:
+            # Chunks are dictionaries with sheet_name metadata populated
             chunks = process_tabular_file(temp_file_path, file.filename)
+            data_to_insert = []
+            for c in chunks:
+                c["source"] = file.filename
+                data_to_insert.append(c)
         else:
-            chunks = process_standard_file(temp_file_path, file.filename)
+            raw_chunks = process_standard_file(temp_file_path, file.filename)
+            # Default missing sheet_name properties during standard ingestion to prevent validation errors
+            data_to_insert = [
+                {
+                    "text": chunk,
+                    "source": file.filename,
+                    "source_type": source_type,
+                    "sheet_name": ""
+                }
+                for chunk in raw_chunks
+            ]
 
-        if not chunks:
+        if not data_to_insert:
             raise HTTPException(status_code=400, detail="No content extracted.")
-
-        data_to_insert = [
-            {
-                "text": chunk,
-                "source": file.filename,
-                "source_type": source_type
-            }
-            for chunk in chunks
-        ]
 
         global table
         table.add(data_to_insert)
@@ -171,7 +256,7 @@ async def upload_file(file: UploadFile = File(...)):
             "status": "success",
             "filename": file.filename,
             "source_type": source_type,
-            "chunks_processed": len(chunks)
+            "chunks_processed": len(data_to_insert)
         }
 
     finally:
@@ -182,27 +267,31 @@ async def upload_file(file: UploadFile = File(...)):
 class ChatRequest(BaseModel):
     query: str
     source_type: str  # 'tabular' or 'standard'
+    chat_history: Optional[List[dict]] = []  # Interactive memory history
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    """Performs explicit query embedding to avoid registry bugs, then queries Ollama."""
+    """Executes query condensation, converts search string to dense vector, and queries Ollama."""
     if request.source_type not in ["tabular", "standard"]:
         raise HTTPException(status_code=400, detail="source_type must be 'tabular' or 'standard'")
+
+    # Step 1: Run conversational memory condensation
+    search_query = condense_query(request.chat_history, request.query)
 
     # Configure hybrid search ratio (alpha) dynamically
     alpha = 0.3 if request.source_type == "tabular" else 0.6
 
     try:
-        # Step 1: Explicitly generate the embedding for the query text
-        query_vector = embedding_function.compute_query_embeddings(request.query)[0]
+        # Step 2: Explicitly generate embedding for search query (resolves registry bug)
+        query_vector = embedding_function.compute_query_embeddings(search_query)[0]
 
-        # Step 2: Use explicit linear combiner to merge vectors and full-text search
-        reranker = LinearCombinationReranker(weight=alpha)
+        # Step 3: Fixed parameter assignment (alpha=alpha instead of weight=alpha)
+        reranker = LinearCombinationReranker(alpha)
 
         search_results = (
             table.search(query_type="hybrid")
             .vector(query_vector)
-            .text(request.query)
+            .text(search_query)
             .where(f"source_type = '{request.source_type}'", prefilter=True)
             .limit(5)
             .rerank(reranker=reranker)
@@ -221,7 +310,7 @@ async def chat(request: ChatRequest):
         "If you do not know the answer or if it's not present in the context, say that you do not know.\n"
         "Do not make up facts.\n\n"
         f"--- DOCUMENT CONTEXT ---\n{context_str}\n\n"
-        f"--- USER QUESTION ---\n{request.query}"
+        f"--- USER QUESTION (REPHRASED) ---\n{search_query}"
     )
 
     try:

@@ -155,9 +155,12 @@ if prompt := st.chat_input("Enter your query here..."):
         message_placeholder.markdown("Computing...")
         
         try:
+            # Send all messages EXCEPT the current prompt
+            history_payload = st.session_state.messages[:-1]
             payload = {
                 "query": prompt,
-                "source_type": source_type
+                "source_type": source_type,
+                "chat_history": history_payload
             }
             response = requests.post(f"{FASTAPI_URL}/chat", json=payload)
             if response.status_code == 200:
