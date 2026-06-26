@@ -1,0 +1,30 @@
+# Core API framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Pydantic for data validation
+pydantic>=2.7.0
+
+# LanceDB - embedded vector database with hybrid search support
+lancedb>=0.8.0
+tantivy>=0.22.0        # Required by LanceDB for BM25 / full-text search indexing
+
+# Sentence-Transformers for local Hugging Face embeddings (offline)
+sentence-transformers>=3.0.0
+torch>=2.3.0           # PyTorch backend for sentence-transformers
+
+# Ollama Python client (talks to the local Ollama daemon)
+ollama>=0.2.0
+
+# Document parsers
+pypdf>=4.2.0           # PDF parsing
+python-pptx>=0.6.23   # PowerPoint (.pptx) parsing
+pandas>=2.2.0          # CSV / Excel tabular ingestion
+openpyxl>=3.1.0        # Excel (.xlsx) engine for pandas
+
+# Multipart file upload support for FastAPI
+python-multipart>=0.0.9
+
+# Utilities
+numpy>=1.26.0
+tqdm>=4.66.0

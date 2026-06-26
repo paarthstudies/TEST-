@@ -1,0 +1,25 @@
+# LanceDB on-disk store
+lancedb_store/
+
+# Temporary uploads
+uploads/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# HuggingFace model cache (large, re-downloadable)
+.cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
