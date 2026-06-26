@@ -76,13 +76,33 @@ def process_tabular_file(file_path: str, filename: str) -> List[str]:
     ext = os.path.splitext(filename)[1].lower()
     
     if ext == ".csv":
-        df = pd.read_csv(file_path)
+        df_raw = pd.read_csv(file_path, header=None)
     elif ext in [".xls", ".xlsx"]:
-        df = pd.read_excel(file_path)
+        df_raw = pd.read_excel(file_path, header=None)
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported tabular file type: {ext}")
 
+    # Sweep first 15 rows to find the true header
+    head_df = df_raw.head(15).fillna("")
+    max_non_empty = -1
+    header_idx = 0
+    
+    for idx, row in head_df.iterrows():
+        non_empty_count = sum(1 for val in row if str(val).strip() != "")
+        if non_empty_count > max_non_empty:
+            max_non_empty = non_empty_count
+            header_idx = idx
+
     chunks = []
+    if max_non_empty == 0:
+        return chunks
+
+    # Re-read with the correct header index
+    if ext == ".csv":
+        df = pd.read_csv(file_path, header=header_idx)
+    elif ext in [".xls", ".xlsx"]:
+        df = pd.read_excel(file_path, header=header_idx)
+        
     df = df.fillna("")
     columns = df.columns.tolist()
 
@@ -103,8 +123,9 @@ def process_tabular_file(file_path: str, filename: str) -> List[str]:
             if val:
                 facts.append(f"The {col} of {entity_name} is {val}.")
         
-        anchored_sentence = f"Regarding {primary_col} {entity_name}: " + " ".join(facts)
-        chunks.append(anchored_sentence)
+        if facts:
+            anchored_sentence = f"Regarding {primary_col} {entity_name}: " + " ".join(facts)
+            chunks.append(anchored_sentence)
 
     return chunks
 
