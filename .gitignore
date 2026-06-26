@@ -1,5 +1,6 @@
 # LanceDB on-disk store
 lancedb_store/
+.lancedb/
 
 # Temporary uploads
 uploads/
